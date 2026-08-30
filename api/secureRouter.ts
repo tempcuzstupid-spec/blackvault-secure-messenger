@@ -6,6 +6,7 @@ import { createRouter, publicQuery } from "./middleware";
 import { authedQuery } from "./auth";
 import { getDb } from "./queries/connection";
 import { wsHub } from "./ws/hub";
+import { ensureWritable, getDb } from "./queries/connection";
 import { agents, sessions, channels, memberships, messages } from "@db/schema";
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24h, re-login required after
@@ -46,10 +47,12 @@ export const secureRouter = createRouter({
         if (existing.length > 0) {
           throw new TRPCError({ code: "UNAUTHORIZED", message: "Key not recognized" });
         }
+        await ensureWritable();
         const [row] = await db.insert(agents).values({ keyHash: input.keyHash }).returning({ id: agents.id });
         agent = { id: row.id, keyHash: input.keyHash, createdAt: new Date() };
       }
 
+      await ensureWritable();
       const token = randomBytes(32).toString("hex");
       await db.insert(sessions).values({
         token,
@@ -62,6 +65,7 @@ export const secureRouter = createRouter({
   logout: authedQuery.mutation(async ({ ctx }) => {
     const header = ctx.req.headers.get("authorization") ?? "";
     const token = header.slice(7);
+    await ensureWritable();
     await getDb().delete(sessions).where(eq(sessions.token, token));
     return { ok: true };
   }),
@@ -74,6 +78,7 @@ export const secureRouter = createRouter({
   issueAccessKey: authedQuery
     .input(z.object({ keyHash: z.string().regex(/^[a-f0-9]{64}$/) }))
     .mutation(async ({ input }) => {
+      await ensureWritable();
       const db = getDb();
       const [dupe] = await db
         .select({ id: agents.id })
@@ -92,6 +97,7 @@ export const secureRouter = createRouter({
   createChannel: authedQuery
     .input(z.object({ inviteHash: z.string().regex(/^[a-f0-9]{64}$/) }))
     .mutation(async ({ ctx, input }) => {
+      await ensureWritable();
       const db = getDb();
       const [row] = await db
         .insert(channels)
@@ -119,6 +125,7 @@ export const secureRouter = createRouter({
         .where(and(eq(memberships.channelId, channel.id), eq(memberships.agentId, ctx.agentId)))
         .limit(1);
       if (!existing) {
+        await ensureWritable();
         await db.insert(memberships).values({ channelId: channel.id, agentId: ctx.agentId });
         wsHub.broadcast(channel.id, {
           type: "channel.member_joined",
@@ -166,6 +173,7 @@ export const secureRouter = createRouter({
     )
     .mutation(async ({ ctx, input }) => {
       await requireMember(input.channelId, ctx.agentId);
+      await ensureWritable();
       const db = getDb();
       const [row] = await db.insert(messages).values({
         channelId: input.channelId,
