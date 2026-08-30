@@ -47,5 +47,23 @@ export const messages = pgTable("messages", {
   agentId: integer("agent_id").notNull(),
   ciphertext: text("ciphertext").notNull(),
   nonce: text("nonce").notNull(),
+  // Optional reference to a parent message for replies. NULL = top-level.
+  replyTo: integer("reply_to"),
+  // Set when the author edits the message. UI shows "(edited)" badge.
+  editedAt: timestamp("edited_at", { withTimezone: true }),
+  // Soft delete: when set, the server returns the message with empty
+  // ciphertext and a "[deleted]" placeholder rendered client-side.
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Reactions: one row per (messageId, agentId, emoji). The (messageId,
+// agentId, emoji) tuple is unique so the same agent can't add the same
+// emoji twice. UI typically exposes a small fixed set (👍 ❤️ 😂 😮 😢).
+export const reactions = pgTable("reactions", {
+  id: serial("id").primaryKey(),
+  messageId: integer("message_id").notNull(),
+  agentId: integer("agent_id").notNull(),
+  emoji: text("emoji").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

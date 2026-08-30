@@ -1,13 +1,13 @@
 import { z } from "zod";
 import { randomBytes } from "node:crypto";
 import { TRPCError } from "@trpc/server";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { createRouter, publicQuery } from "./middleware";
 import { authedQuery } from "./auth";
 import { getDb } from "./queries/connection";
 import { sseHub } from "./sse/hub";
-import { ensureWritable, getDb } from "./queries/connection";
-import { agents, sessions, channels, memberships, messages } from "@db/schema";
+import { ensureWritable } from "./queries/connection";
+import { agents, sessions, channels, memberships, messages, reactions } from "@db/schema";
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24h, re-login required after
 
@@ -169,10 +169,20 @@ export const secureRouter = createRouter({
         channelId: z.number().int().positive(),
         ciphertext: z.string().min(1).max(16384),
         nonce: z.string().min(8).max(32),
+        replyTo: z.number().int().positive().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
       await requireMember(input.channelId, ctx.agentId);
+      // If replying, the parent message must exist in the same channel.
+      if (input.replyTo != null) {
+        const [parent] = await getDb()
+          .select({ id: messages.id })
+          .from(messages)
+          .where(eq(messages.id, input.replyTo))
+          .limit(1);
+        if (!parent) throw new TRPCError({ code: "NOT_FOUND", message: "Reply target not found" });
+      }
       await ensureWritable();
       const db = getDb();
       const [row] = await db.insert(messages).values({
@@ -180,7 +190,13 @@ export const secureRouter = createRouter({
         agentId: ctx.agentId,
         ciphertext: input.ciphertext,
         nonce: input.nonce,
-      }).returning({ id: messages.id, createdAt: messages.createdAt });
+        replyTo: input.replyTo ?? null,
+      }).returning({ id: messages.id, createdAt: messages.createdAt, replyTo: messages.replyTo });
+      const [{ keyHash }] = await db
+        .select({ keyHash: agents.keyHash })
+        .from(agents)
+        .where(eq(agents.id, ctx.agentId))
+        .limit(1);
       sseHub.broadcast(input.channelId, {
         type: "message.created",
         channelId: input.channelId,
@@ -189,12 +205,137 @@ export const secureRouter = createRouter({
           ciphertext: input.ciphertext,
           nonce: input.nonce,
           createdAt: row.createdAt,
-          senderTag: tagOf((await db
-            .select({ keyHash: agents.keyHash })
-            .from(agents)
-            .where(eq(agents.id, ctx.agentId))
-            .limit(1))[0].keyHash),
+          replyTo: row.replyTo,
+          senderTag: tagOf(keyHash),
         },
+      });
+      return { ok: true, id: row.id };
+    }),
+
+  editMessage: authedQuery
+    .input(
+      z.object({
+        messageId: z.number().int().positive(),
+        ciphertext: z.string().min(1).max(16384),
+        nonce: z.string().min(8).max(32),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const db = getDb();
+      const [msg] = await db
+        .select({ id: messages.id, channelId: messages.channelId, agentId: messages.agentId, deletedAt: messages.deletedAt })
+        .from(messages)
+        .where(eq(messages.id, input.messageId))
+        .limit(1);
+      if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Message not found" });
+      if (msg.agentId !== ctx.agentId) throw new TRPCError({ code: "FORBIDDEN", message: "Not your message" });
+      if (msg.deletedAt) throw new TRPCError({ code: "GONE", message: "Message is deleted" });
+      await requireMember(msg.channelId, ctx.agentId);
+      await ensureWritable();
+      const [updated] = await db.update(messages)
+        .set({ ciphertext: input.ciphertext, nonce: input.nonce, editedAt: new Date() })
+        .where(eq(messages.id, input.messageId))
+        .returning({ id: messages.id, editedAt: messages.editedAt });
+      sseHub.broadcast(msg.channelId, {
+        type: "message.updated",
+        channelId: msg.channelId,
+        message: {
+          id: updated.id,
+          ciphertext: input.ciphertext,
+          nonce: input.nonce,
+          editedAt: updated.editedAt,
+        },
+      });
+      return { ok: true };
+    }),
+
+  deleteMessage: authedQuery
+    .input(z.object({ messageId: z.number().int().positive() }))
+    .mutation(async ({ ctx, input }) => {
+      const db = getDb();
+      const [msg] = await db
+        .select({ id: messages.id, channelId: messages.channelId, agentId: messages.agentId })
+        .from(messages)
+        .where(eq(messages.id, input.messageId))
+        .limit(1);
+      if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Message not found" });
+      if (msg.agentId !== ctx.agentId) throw new TRPCError({ code: "FORBIDDEN", message: "Not your message" });
+      await requireMember(msg.channelId, ctx.agentId);
+      await ensureWritable();
+      await db.update(messages)
+        .set({ deletedAt: new Date(), ciphertext: "", nonce: "" })
+        .where(eq(messages.id, input.messageId));
+      sseHub.broadcast(msg.channelId, {
+        type: "message.deleted",
+        channelId: msg.channelId,
+        messageId: input.messageId,
+      });
+      return { ok: true };
+    }),
+
+  addReaction: authedQuery
+    .input(z.object({
+      messageId: z.number().int().positive(),
+      emoji: z.string().min(1).max(16),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = getDb();
+      const [msg] = await db
+        .select({ id: messages.id, channelId: messages.channelId })
+        .from(messages)
+        .where(eq(messages.id, input.messageId))
+        .limit(1);
+      if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Message not found" });
+      await requireMember(msg.channelId, ctx.agentId);
+      await ensureWritable();
+      // Idempotent: ignore the unique-constraint violation if the
+      // (message, agent, emoji) row already exists.
+      try {
+        await db.insert(reactions).values({
+          messageId: input.messageId,
+          agentId: ctx.agentId,
+          emoji: input.emoji,
+        });
+      } catch (e: any) {
+        if (!String(e?.message ?? "").includes("duplicate")) throw e;
+      }
+      sseHub.broadcast(msg.channelId, {
+        type: "reaction.added",
+        channelId: msg.channelId,
+        messageId: input.messageId,
+        agentId: ctx.agentId,
+        emoji: input.emoji,
+      });
+      return { ok: true };
+    }),
+
+  removeReaction: authedQuery
+    .input(z.object({
+      messageId: z.number().int().positive(),
+      emoji: z.string().min(1).max(16),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = getDb();
+      const [msg] = await db
+        .select({ id: messages.id, channelId: messages.channelId })
+        .from(messages)
+        .where(eq(messages.id, input.messageId))
+        .limit(1);
+      if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Message not found" });
+      await requireMember(msg.channelId, ctx.agentId);
+      await ensureWritable();
+      await db.delete(reactions)
+        .where(and(
+          eq(reactions.messageId, input.messageId),
+          eq(reactions.agentId, ctx.agentId),
+          eq(reactions.emoji, input.emoji),
+        ));
+      sseHub.broadcast(msg.channelId, {
+        type: "reaction.removed",
+        channelId: msg.channelId,
+        messageId: input.messageId,
+        agentId: ctx.agentId,
+        emoji: input.emoji,
       });
       return { ok: true };
     }),
@@ -212,6 +353,9 @@ export const secureRouter = createRouter({
           id: messages.id,
           ciphertext: messages.ciphertext,
           nonce: messages.nonce,
+          replyTo: messages.replyTo,
+          editedAt: messages.editedAt,
+          deletedAt: messages.deletedAt,
           createdAt: messages.createdAt,
           keyHash: agents.keyHash,
         })
@@ -220,12 +364,29 @@ export const secureRouter = createRouter({
         .where(cond)
         .orderBy(asc(messages.id))
         .limit(200);
+      const ids = rows.map((r) => r.id);
+      const rxByMessage = new Map<number, Array<{ agentId: number; emoji: string }>>();
+      if (ids.length > 0) {
+        const rx = await db
+          .select({ messageId: reactions.messageId, agentId: reactions.agentId, emoji: reactions.emoji })
+          .from(reactions)
+          .where(inArray(reactions.messageId, ids));
+        for (const r of rx) {
+          const list = rxByMessage.get(r.messageId) ?? [];
+          list.push({ agentId: r.agentId, emoji: r.emoji });
+          rxByMessage.set(r.messageId, list);
+        }
+      }
       return rows.map((r) => ({
         id: r.id,
         ciphertext: r.ciphertext,
         nonce: r.nonce,
+        replyTo: r.replyTo,
+        editedAt: r.editedAt,
+        deletedAt: r.deletedAt,
         createdAt: r.createdAt,
         senderTag: tagOf(r.keyHash),
+        reactions: rxByMessage.get(r.id) ?? [],
       }));
     }),
 });
