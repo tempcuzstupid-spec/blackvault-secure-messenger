@@ -15,9 +15,11 @@ const tagOf = (keyHash: string) => keyHash.slice(0, 6).toUpperCase();
 
 async function requireMember(channelId: number, agentId: number) {
   const db = getDb();
-  const m = await db.query.memberships.findFirst({
-    where: and(eq(memberships.channelId, channelId), eq(memberships.agentId, agentId)),
-  });
+  const [m] = await db
+    .select()
+    .from(memberships)
+    .where(and(eq(memberships.channelId, channelId), eq(memberships.agentId, agentId)))
+    .limit(1);
   if (!m) throw new TRPCError({ code: "FORBIDDEN", message: "Not a channel member" });
 }
 
@@ -31,10 +33,13 @@ export const secureRouter = createRouter({
     .input(z.object({ keyHash: z.string().regex(/^[a-f0-9]{64}$/) }))
     .mutation(async ({ input }) => {
       const db = getDb();
-      let agent = await db.query.agents.findFirst({
-        where: eq(agents.keyHash, input.keyHash),
-      });
+      const [found] = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.keyHash, input.keyHash))
+        .limit(1);
 
+      let agent = found;
       if (!agent) {
         const existing = await db.select({ id: agents.id }).from(agents).limit(1);
         if (existing.length > 0) {
@@ -69,9 +74,11 @@ export const secureRouter = createRouter({
     .input(z.object({ keyHash: z.string().regex(/^[a-f0-9]{64}$/) }))
     .mutation(async ({ input }) => {
       const db = getDb();
-      const dupe = await db.query.agents.findFirst({
-        where: eq(agents.keyHash, input.keyHash),
-      });
+      const [dupe] = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.keyHash, input.keyHash))
+        .limit(1);
       if (dupe) throw new TRPCError({ code: "CONFLICT", message: "Key already exists" });
       await db.insert(agents).values({ keyHash: input.keyHash });
       return { ok: true };
@@ -97,13 +104,17 @@ export const secureRouter = createRouter({
     .input(z.object({ inviteHash: z.string().regex(/^[a-f0-9]{64}$/) }))
     .mutation(async ({ ctx, input }) => {
       const db = getDb();
-      const channel = await db.query.channels.findFirst({
-        where: eq(channels.inviteHash, input.inviteHash),
-      });
+      const [channel] = await db
+        .select()
+        .from(channels)
+        .where(eq(channels.inviteHash, input.inviteHash))
+        .limit(1);
       if (!channel) throw new TRPCError({ code: "NOT_FOUND", message: "Invalid invite code" });
-      const existing = await db.query.memberships.findFirst({
-        where: and(eq(memberships.channelId, channel.id), eq(memberships.agentId, ctx.agentId)),
-      });
+      const [existing] = await db
+        .select()
+        .from(memberships)
+        .where(and(eq(memberships.channelId, channel.id), eq(memberships.agentId, ctx.agentId)))
+        .limit(1);
       if (!existing) {
         await db.insert(memberships).values({ channelId: channel.id, agentId: ctx.agentId });
       }

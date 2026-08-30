@@ -12,9 +12,11 @@ export const authedQuery = publicQuery.use(async ({ ctx, next }) => {
   if (!token) throw new TRPCError({ code: "UNAUTHORIZED", message: "No session" });
 
   const db = getDb();
-  const session = await db.query.sessions.findFirst({
-    where: eq(sessions.token, token),
-  });
+  const [session] = await db
+    .select()
+    .from(sessions)
+    .where(eq(sessions.token, token))
+    .limit(1);
   if (!session || session.expiresAt.getTime() < Date.now()) {
     throw new TRPCError({ code: "UNAUTHORIZED", message: "Session expired" });
   }
