@@ -1,11 +1,10 @@
 import {
-  mysqlTable,
+  pgTable,
   serial,
-  varchar,
   text,
   timestamp,
-  bigint,
-} from "drizzle-orm/mysql-core";
+  integer,
+} from "drizzle-orm/pg-core";
 
 // Zero-knowledge server design:
 // - The server NEVER sees plaintext access keys, invite codes, or message content.
@@ -14,39 +13,39 @@ import {
 // - Messages are stored as AES-256-GCM ciphertext + nonce. Keys are derived
 //   client-side (HKDF from the invite code) and never leave the device.
 
-export const agents = mysqlTable("agents", {
+export const agents = pgTable("agents", {
   id: serial("id").primaryKey(),
-  keyHash: varchar("key_hash", { length: 64 }).notNull().unique(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
+  keyHash: text("key_hash").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const sessions = mysqlTable("sessions", {
+export const sessions = pgTable("sessions", {
   id: serial("id").primaryKey(),
-  token: varchar("token", { length: 64 }).notNull().unique(),
-  agentId: bigint("agent_id", { mode: "number", unsigned: true }).notNull(),
-  expiresAt: timestamp("expires_at").notNull(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
+  token: text("token").notNull().unique(),
+  agentId: integer("agent_id").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const channels = mysqlTable("channels", {
+export const channels = pgTable("channels", {
   id: serial("id").primaryKey(),
-  inviteHash: varchar("invite_hash", { length: 64 }).notNull().unique(),
-  createdBy: bigint("created_by", { mode: "number", unsigned: true }).notNull(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
+  inviteHash: text("invite_hash").notNull().unique(),
+  createdBy: integer("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const memberships = mysqlTable("memberships", {
+export const memberships = pgTable("memberships", {
   id: serial("id").primaryKey(),
-  channelId: bigint("channel_id", { mode: "number", unsigned: true }).notNull(),
-  agentId: bigint("agent_id", { mode: "number", unsigned: true }).notNull(),
-  joinedAt: timestamp("joined_at").notNull().defaultNow(),
+  channelId: integer("channel_id").notNull(),
+  agentId: integer("agent_id").notNull(),
+  joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const messages = mysqlTable("messages", {
+export const messages = pgTable("messages", {
   id: serial("id").primaryKey(),
-  channelId: bigint("channel_id", { mode: "number", unsigned: true }).notNull(),
-  agentId: bigint("agent_id", { mode: "number", unsigned: true }).notNull(),
+  channelId: integer("channel_id").notNull(),
+  agentId: integer("agent_id").notNull(),
   ciphertext: text("ciphertext").notNull(),
-  nonce: varchar("nonce", { length: 32 }).notNull(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
+  nonce: text("nonce").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

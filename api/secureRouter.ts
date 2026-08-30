@@ -40,7 +40,7 @@ export const secureRouter = createRouter({
         if (existing.length > 0) {
           throw new TRPCError({ code: "UNAUTHORIZED", message: "Key not recognized" });
         }
-        const [row] = await db.insert(agents).values({ keyHash: input.keyHash }).$returningId();
+        const [row] = await db.insert(agents).values({ keyHash: input.keyHash }).returning({ id: agents.id });
         agent = { id: row.id, keyHash: input.keyHash, createdAt: new Date() };
       }
 
@@ -88,7 +88,7 @@ export const secureRouter = createRouter({
       const [row] = await db
         .insert(channels)
         .values({ inviteHash: input.inviteHash, createdBy: ctx.agentId })
-        .$returningId();
+        .returning({ id: channels.id });
       await db.insert(memberships).values({ channelId: row.id, agentId: ctx.agentId });
       return { channelId: row.id };
     }),
