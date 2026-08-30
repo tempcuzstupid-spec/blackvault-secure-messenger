@@ -5,6 +5,7 @@ import { and, asc, eq, gt } from "drizzle-orm";
 import { createRouter, publicQuery } from "./middleware";
 import { authedQuery } from "./auth";
 import { getDb } from "./queries/connection";
+import { wsHub } from "./ws/hub";
 import { agents, sessions, channels, memberships, messages } from "@db/schema";
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24h, re-login required after
@@ -97,6 +98,8 @@ export const secureRouter = createRouter({
         .values({ inviteHash: input.inviteHash, createdBy: ctx.agentId })
         .returning({ id: channels.id });
       await db.insert(memberships).values({ channelId: row.id, agentId: ctx.agentId });
+      // No broadcast needed: the creator is the only member. The next
+      // joinChannel call will broadcast membership.added.
       return { channelId: row.id };
     }),
 
@@ -117,6 +120,12 @@ export const secureRouter = createRouter({
         .limit(1);
       if (!existing) {
         await db.insert(memberships).values({ channelId: channel.id, agentId: ctx.agentId });
+        wsHub.broadcast(channel.id, {
+          type: "channel.member_joined",
+          channelId: channel.id,
+          agentId: ctx.agentId,
+          online: wsHub.presenceSnapshot(channel.id),
+        });
       }
       return { channelId: channel.id };
     }),
@@ -157,11 +166,27 @@ export const secureRouter = createRouter({
     )
     .mutation(async ({ ctx, input }) => {
       await requireMember(input.channelId, ctx.agentId);
-      await getDb().insert(messages).values({
+      const db = getDb();
+      const [row] = await db.insert(messages).values({
         channelId: input.channelId,
         agentId: ctx.agentId,
         ciphertext: input.ciphertext,
         nonce: input.nonce,
+      }).returning({ id: messages.id, createdAt: messages.createdAt });
+      wsHub.broadcast(input.channelId, {
+        type: "message.created",
+        channelId: input.channelId,
+        message: {
+          id: row.id,
+          ciphertext: input.ciphertext,
+          nonce: input.nonce,
+          createdAt: row.createdAt,
+          senderTag: tagOf((await db
+            .select({ keyHash: agents.keyHash })
+            .from(agents)
+            .where(eq(agents.id, ctx.agentId))
+            .limit(1))[0].keyHash),
+        },
       });
       return { ok: true };
     }),

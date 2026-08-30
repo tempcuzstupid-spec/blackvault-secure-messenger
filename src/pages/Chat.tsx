@@ -3,8 +3,9 @@ import { useNavigate } from "react-router";
 import { trpc } from "@/providers/trpc";
 import { decryptText, deriveChannelKey, encryptText, generateCode, normalizeCode, sha256Hex } from "@/lib/crypto";
 import { clearSession, getAgentTag, getLocalChannels, rememberChannel } from "@/lib/session";
+import { openWs, sendWs, useWsConnection, useWsEvent } from "@/lib/ws";
 import {
-  ShieldCheck, Plus, LogIn, UserPlus, Send, LogOut, Copy, Check, Hash, Lock,
+  ShieldCheck, Plus, LogIn, UserPlus, Send, LogOut, Copy, Check, Hash, Lock, Wifi, WifiOff,
 } from "lucide-react";
 
 type PlainMsg = { id: number; senderTag: string; text: string; createdAt: Date };
@@ -31,10 +32,66 @@ export default function Chat() {
     { channelId: activeId! },
     { enabled: activeId != null },
   );
+  // Initial message load: poll once on channel change, then let WS push
+  // updates. This avoids the cold-start race where the WS connects after
+  // the user has already loaded the page.
   const messagesQuery = trpc.secure.listMessages.useQuery(
     { channelId: activeId! },
-    { enabled: activeId != null, refetchInterval: 2500 },
+    { enabled: activeId != null, refetchInterval: false, refetchOnWindowFocus: false },
   );
+
+  // Live state derived from WS events
+  const [onlineByChannel, setOnlineByChannel] = useState<Record<number, number[]>>({});
+  const [typingByChannel, setTypingByChannel] = useState<Record<number, Record<number, boolean>>>({});
+  const wsState = useWsConnection();
+
+  useEffect(() => {
+    openWs();
+  }, []);
+
+  // Subscribe to the active channel over WS
+  useEffect(() => {
+    if (activeId == null) return;
+    sendWs({ type: "subscribe", channelId: activeId });
+    return () => { sendWs({ type: "unsubscribe", channelId: activeId }); };
+  }, [activeId]);
+
+  // Live message arrival: decrypt and append
+  useWsEvent("message.created", async (e) => {
+    if (e.channelId !== activeId) return;
+    const key = await getKey(e.channelId);
+    if (!key) return;
+    let text: string;
+    try {
+      text = await decryptText(key, e.message.ciphertext, e.message.nonce);
+    } catch {
+      text = "[unable to decrypt]";
+    }
+    setPlain((p) => ({
+      ...p,
+      [e.channelId]: [...(p[e.channelId] ?? []), {
+        id: e.message.id,
+        senderTag: e.message.senderTag,
+        text,
+        createdAt: new Date(e.message.createdAt),
+      }],
+    }));
+  });
+
+  useWsEvent("presence.update", (e) => {
+    setOnlineByChannel((s) => ({ ...s, [e.channelId]: e.online }));
+  });
+  useWsEvent("channel.member_joined", (e) => {
+    setOnlineByChannel((s) => ({ ...s, [e.channelId]: e.online }));
+  });
+  useWsEvent("typing.update", (e) => {
+    setTypingByChannel((s) => {
+      const cur = { ...(s[e.channelId] ?? {}) };
+      if (e.isTyping) cur[e.agentId] = true;
+      else delete cur[e.agentId];
+      return { ...s, [e.channelId]: cur };
+    });
+  });
 
   const createChannel = trpc.secure.createChannel.useMutation();
   const joinChannel = trpc.secure.joinChannel.useMutation();
@@ -156,12 +213,32 @@ export default function Chat() {
     const { ciphertext, nonce } = await encryptText(key, draft.trim());
     const text = draft.trim();
     setDraft("");
+    // typing.stop is implicit when the draft clears
+    if (activeId) sendWs({ type: "typing.stop", channelId: activeId });
     await sendMessage.mutateAsync({ channelId: activeId, ciphertext, nonce });
-    utils.secure.listMessages.invalidate();
-    setPlain((p) => ({
-      ...p,
-      [activeId]: [...(p[activeId] ?? []), { id: Date.now(), senderTag: myTag, text, createdAt: new Date() }],
-    }));
+    // The WS message.created broadcast will append the message; we don't
+    // optimistic-insert here anymore (the broadcast handles it). The
+    // server is the source of truth for message ids and timestamps.
+  }
+
+  // Typing: send typing.start on first keystroke, typing.stop 3s after
+  // the last keystroke (or when the draft is cleared).
+  const typingTimer = useRef<number | null>(null);
+  function onDraftChange(v: string) {
+    setDraft(v);
+    if (activeId == null) return;
+    if (v.length === 0) {
+      if (typingTimer.current != null) window.clearTimeout(typingTimer.current);
+      typingTimer.current = null;
+      sendWs({ type: "typing.stop", channelId: activeId });
+      return;
+    }
+    sendWs({ type: "typing.start", channelId: activeId });
+    if (typingTimer.current != null) window.clearTimeout(typingTimer.current);
+    typingTimer.current = window.setTimeout(() => {
+      sendWs({ type: "typing.stop", channelId: activeId });
+      typingTimer.current = null;
+    }, 3000);
   }
 
   function handleLogout() {
@@ -284,9 +361,18 @@ export default function Chat() {
                 <span className="ml-2 flex items-center gap-1 rounded-full border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-400">
                   <Lock className="h-2.5 w-2.5" /> E2E encrypted
                 </span>
+                <span className={`ml-2 flex items-center gap-1 text-[10px] ${wsState === "open" ? "text-emerald-400" : "text-amber-400"}`} title={wsState === "open" ? "Live connection" : "Reconnecting…"}>
+                  {wsState === "open" ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+                  {wsState === "open" ? "live" : "offline"}
+                </span>
               </div>
               <span className="text-xs text-neutral-600">
                 {membersQuery.data?.length ?? 0} member(s): {(membersQuery.data ?? []).map((m) => m.tag).join(" · ")}
+                {(() => {
+                  const online = onlineByChannel[activeId!] ?? [];
+                  if (online.length === 0) return null;
+                  return <span className="ml-2 text-emerald-400">{online.length} online</span>;
+                })()}
               </span>
             </div>
 
@@ -313,6 +399,20 @@ export default function Chat() {
                   </span>
                 </div>
               ))}
+              {(() => {
+                const typing = Object.keys(typingByChannel[activeId!] ?? {}).filter((id) => Number(id) !== undefined);
+                if (typing.length === 0) return null;
+                return (
+                  <div className="flex items-center gap-2 px-2 text-[10px] text-neutral-500">
+                    <span className="flex gap-0.5">
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400 [animation-delay:-0.3s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400 [animation-delay:-0.15s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400" />
+                    </span>
+                    {typing.length === 1 ? "someone" : `${typing.length} people`} typing…
+                  </div>
+                );
+              })()}
               <div ref={bottomRef} />
             </div>
 
@@ -320,7 +420,7 @@ export default function Chat() {
               <div className="flex items-center gap-2">
                 <input
                   value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
+                  onChange={(e) => onDraftChange(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleSend()}
                   placeholder="Message (encrypted before it leaves this device)…"
                   className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-4 py-2.5 text-sm outline-none placeholder:text-neutral-600 focus:border-emerald-500"
