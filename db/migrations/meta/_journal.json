@@ -15,6 +15,13 @@
       "when": 1788091483792,
       "tag": "0001_free_wiccan",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788091879466,
+      "tag": "0002_normal_komodo",
+      "breakpoints": true
     }
   ]
 }

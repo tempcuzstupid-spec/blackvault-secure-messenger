@@ -67,3 +67,18 @@ export const reactions = pgTable("reactions", {
   emoji: text("emoji").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// Web Push subscriptions: one row per (agentId, endpoint). When the
+// user enables push on a device, the browser's PushManager.subscribe()
+// returns an endpoint + p256dh + auth keypair; we persist those so
+// the server can send pushes to that device later. `userAgent` is for
+// debug visibility in the dashboard; the server doesn't act on it.
+export const pushSubscriptions = pgTable("push_subscriptions", {
+  id: serial("id").primaryKey(),
+  agentId: integer("agent_id").notNull(),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  userAgent: text("user_agent"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});

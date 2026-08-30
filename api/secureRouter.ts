@@ -7,7 +7,7 @@ import { authedQuery } from "./auth";
 import { getDb } from "./queries/connection";
 import { sseHub } from "./sse/hub";
 import { ensureWritable } from "./queries/connection";
-import { agents, sessions, channels, memberships, messages, reactions } from "@db/schema";
+import { agents, sessions, channels, memberships, messages, reactions, pushSubscriptions } from "@db/schema";
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24h, re-login required after
 
@@ -69,6 +69,64 @@ export const secureRouter = createRouter({
     await getDb().delete(sessions).where(eq(sessions.token, token));
     return { ok: true };
   }),
+
+  // ---- Push subscriptions (Web Push API) ------------------------------------
+
+  // Client calls this after PushManager.subscribe() succeeds, passing
+  // the resulting subscription object. The server stores it for later
+  // push delivery. VAPID public key is fetched separately via
+  // /api/push/vapid-key (no auth required — it's public).
+  subscribePush: authedQuery
+    .input(z.object({
+      endpoint: z.string().url(),
+      keys: z.object({
+        p256dh: z.string().min(1),
+        auth: z.string().min(1),
+      }),
+      userAgent: z.string().max(512).optional(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      await ensureWritable();
+      // Idempotent: replace if exists, else insert
+      const db = getDb();
+      const [existing] = await db
+        .select({ id: pushSubscriptions.id })
+        .from(pushSubscriptions)
+        .where(eq(pushSubscriptions.endpoint, input.endpoint))
+        .limit(1);
+      if (existing) {
+        await db.update(pushSubscriptions)
+          .set({
+            agentId: ctx.agentId,
+            p256dh: input.keys.p256dh,
+            auth: input.keys.auth,
+            userAgent: input.userAgent ?? null,
+          })
+          .where(eq(pushSubscriptions.id, existing.id));
+      } else {
+        await db.insert(pushSubscriptions).values({
+          agentId: ctx.agentId,
+          endpoint: input.endpoint,
+          p256dh: input.keys.p256dh,
+          auth: input.keys.auth,
+          userAgent: input.userAgent ?? null,
+        });
+      }
+      return { ok: true };
+    }),
+
+  unsubscribePush: authedQuery
+    .input(z.object({ endpoint: z.string().url() }))
+    .mutation(async ({ ctx, input }) => {
+      await ensureWritable();
+      await getDb()
+        .delete(pushSubscriptions)
+        .where(and(
+          eq(pushSubscriptions.endpoint, input.endpoint),
+          eq(pushSubscriptions.agentId, ctx.agentId),
+        ));
+      return { ok: true };
+    }),
 
   // ---- Invites --------------------------------------------------------------
 
@@ -209,6 +267,28 @@ export const secureRouter = createRouter({
           senderTag: tagOf(keyHash),
         },
       });
+
+      // Web Push fallback for recipients not currently connected via
+      // SSE. Find every agent in this channel, drop the sender, and
+      // push a content-hidden notification. Fan out in parallel.
+      try {
+        const memberRows = await db
+          .select({ agentId: memberships.agentId })
+          .from(memberships)
+          .where(eq(memberships.channelId, input.channelId));
+        const agentIds = memberRows.map((m) => m.agentId);
+        if (agentIds.length > 0) {
+          const { pushToAgents } = await import("./push/sender");
+          await pushToAgents(agentIds, {
+            title: "BlackVault",
+            body: "New encrypted message",
+            tag: `bv-channel-${input.channelId}`,
+            url: `/?channel=${input.channelId}`,
+          }, ctx.agentId);
+        }
+      } catch (e) {
+        console.error("push dispatch failed (non-fatal):", e);
+      }
       return { ok: true, id: row.id };
     }),
 

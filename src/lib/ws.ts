@@ -69,10 +69,14 @@ export function sendWs(obj: { type: string; channelId?: number; isTyping?: boole
     : obj.type === "typing.start" || obj.type === "typing.stop" ? "/api/sse/typing"
     : null;
   if (!url) return;
+  const body: any = { channelId: obj.channelId };
+  if (obj.type === "typing.start" || obj.type === "typing.stop") {
+    body.isTyping = obj.type === "typing.start";
+  }
   fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", "Authorization": `Bearer ${token}` },
-    body: JSON.stringify({ channelId: obj.channelId, isTyping: obj.type === "typing.start" ? true : obj.type === "typing.stop" ? false : undefined }),
+    body: JSON.stringify(body),
     keepalive: true,
   }).catch(() => {});
 }

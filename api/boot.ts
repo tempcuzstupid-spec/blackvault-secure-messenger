@@ -23,6 +23,13 @@ app.use("/api/trpc/*", async (c) => {
 // Render's deploy health check).
 app.get("/sse-ping", (c) => c.json({ ok: true, transport: "sse" }));
 
+// Public VAPID public key — clients need this to subscribe to push.
+// No auth (the public key is meant to be public).
+app.get("/api/push/vapid-key", (c) => {
+  if (!env.vapidPublicKey) return c.json({ error: "VAPID not configured" }, 503);
+  return c.json({ publicKey: env.vapidPublicKey, subject: env.vapidSubject });
+});
+
 // SSE endpoint + companion REST controls
 sseHandler(app);
 sseChannelControls(app);

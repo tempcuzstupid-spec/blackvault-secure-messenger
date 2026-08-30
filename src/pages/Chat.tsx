@@ -4,6 +4,7 @@ import { trpc } from "@/providers/trpc";
 import { decryptText, deriveChannelKey, encryptText, generateCode, normalizeCode, sha256Hex } from "@/lib/crypto";
 import { clearSession, getAgentTag, getLocalChannels, rememberChannel } from "@/lib/session";
 import { openWs, sendWs, useWsConnection, useWsEvent } from "@/lib/ws";
+import { ensurePushSubscribed } from "@/lib/push";
 import {
   ShieldCheck, Plus, LogIn, UserPlus, Send, LogOut, Copy, Check, Hash, Lock, Wifi, WifiOff,
   Smile, Reply, Pencil, Trash2, X,
@@ -76,6 +77,10 @@ export default function Chat() {
   }, []);
 
   useEffect(() => { openWs(); }, []);
+
+  // Try to enable Web Push on first mount (only prompts the user the
+  // first time; subsequent mounts are silent if already subscribed).
+  useEffect(() => { void ensurePushSubscribed(); }, []);
 
   useEffect(() => {
     if (activeId == null) return;
