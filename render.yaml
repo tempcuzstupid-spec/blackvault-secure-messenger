@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: blackvault-secure-messenger
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    autoDeploy: true
+    buildCommand: npm install --no-audit --no-fund && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/trpc/ping
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ID
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+    buildFilter:
+      ignoredPaths:
+        - node_modules
+        - dist
+        - .git
