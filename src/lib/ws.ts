@@ -1,11 +1,17 @@
-// Client-side WebSocket hook. One singleton connection per page. Reconnects
-// on close. Routes inbound events to a simple in-memory bus that the rest
-// of the app can subscribe to via `useWsEvent`.
+// Client-side realtime transport. Uses Server-Sent Events (EventSource),
+// which is one-way server->client over a long-lived HTTP response. No
+// WebSocket upgrade dance, works through every proxy. EventSource
+// auto-reconnects with exponential backoff on close.
+//
+// Outbound events (typing.start, subscribe to a new channel) are sent
+// as POST requests to companion REST endpoints. SSE is the receive
+// side only; the request side is normal HTTP.
 
 import { useEffect, useRef, useState } from "react";
 import { getToken } from "./session";
 
-type WsEvent =
+type SseEvent =
+  | { type: "ready"; agentId: number; channels: number[] }
   | { type: "message.created"; channelId: number; message: any }
   | { type: "message.updated"; channelId: number; message: any }
   | { type: "message.deleted"; channelId: number; messageId: number }
@@ -13,84 +19,62 @@ type WsEvent =
   | { type: "reaction.removed"; channelId: number; messageId: number; agentId: number; emoji: string }
   | { type: "typing.update"; channelId: number; agentId: number; isTyping: boolean }
   | { type: "presence.update"; channelId: number; online: number[] }
-  | { type: "channel.member_joined"; channelId: number; agentId: number; online: number[] }
-  | { type: "heartbeat.ack" };
+  | { type: "channel.member_joined"; channelId: number; agentId: number; online: number[] };
 
-type Listener = (e: WsEvent) => void;
+type Listener = (e: SseEvent) => void;
 const listeners = new Set<Listener>();
 
-let socket: WebSocket | null = null;
-let reconnectTimer: number | null = null;
+let es: EventSource | null = null;
 let intentionallyClosed = false;
 
 function urlForToken(token: string): string {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+  return `/sse?token=${encodeURIComponent(token)}`;
 }
 
-export function openWs(): WebSocket | null {
+export function openWs(): EventSource | null {
   const token = getToken();
   if (!token) return null;
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-    return socket;
-  }
+  if (es) return es; // singleton
   intentionallyClosed = false;
-  const ws = new WebSocket(urlForToken(token));
-  socket = ws;
+  es = new EventSource(urlForToken(token));
 
-  ws.addEventListener("open", () => {
-    // Heartbeat: every 25s, send a no-op so the server's TCP keepalive
-    // has a peer; without it some load balancers idle-out the connection.
-    const hb = window.setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ type: "heartbeat" })); } catch {}
-      } else {
-        window.clearInterval(hb);
-      }
-    }, 25000);
-    ws.addEventListener("close", () => window.clearInterval(hb));
-  });
-
-  ws.addEventListener("message", (e) => {
-    let parsed: WsEvent;
-    try { parsed = JSON.parse(e.data); } catch { return; }
+  es.addEventListener("message", (e) => {
+    let parsed: SseEvent;
+    try { parsed = JSON.parse((e as MessageEvent).data); } catch { return; }
     for (const l of listeners) l(parsed);
   });
 
-  ws.addEventListener("close", () => {
-    socket = null;
+  es.addEventListener("error", () => {
+    // EventSource auto-reconnects; just mark state for the UI.
+    // If close was intentional, don't react.
     if (intentionallyClosed) return;
-    if (reconnectTimer != null) return;
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = null;
-      // Only reconnect if we still have a token
-      if (getToken()) openWs();
-    }, 1500);
   });
 
-  ws.addEventListener("error", () => {
-    // The close handler will fire next; reconnect is handled there.
-  });
-
-  return ws;
+  return es;
 }
 
 export function closeWs() {
   intentionallyClosed = true;
-  if (socket) {
-    try { socket.close(); } catch {}
-    socket = null;
-  }
-  if (reconnectTimer != null) {
-    window.clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+  if (es) {
+    try { es.close(); } catch {}
+    es = null;
   }
 }
 
-export function sendWs(obj: unknown) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    try { socket.send(JSON.stringify(obj)); } catch {}
-  }
+export function sendWs(obj: { type: string; channelId?: number; isTyping?: boolean }) {
+  const token = getToken();
+  if (!token) return;
+  const url = obj.type === "subscribe" ? "/api/sse/subscribe"
+    : obj.type === "unsubscribe" ? "/api/sse/unsubscribe"
+    : obj.type === "typing.start" || obj.type === "typing.stop" ? "/api/sse/typing"
+    : null;
+  if (!url) return;
+  fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "Authorization": `Bearer ${token}` },
+    body: JSON.stringify({ channelId: obj.channelId, isTyping: obj.type === "typing.start" ? true : obj.type === "typing.stop" ? false : undefined }),
+    keepalive: true,
+  }).catch(() => {});
 }
 
 export function subscribeWs(fn: Listener): () => void {
@@ -98,34 +82,36 @@ export function subscribeWs(fn: Listener): () => void {
   return () => { listeners.delete(fn); };
 }
 
-/** React hook: subscribe to a specific event type from the WS bus. */
-export function useWsEvent<T extends WsEvent["type"]>(
+export function useWsEvent<T extends SseEvent["type"]>(
   type: T,
-  handler: (e: Extract<WsEvent, { type: T }>) => void,
+  handler: (e: Extract<SseEvent, { type: T }>) => void,
 ) {
   const ref = useRef(handler);
   ref.current = handler;
   useEffect(() => {
     const off = subscribeWs((e) => {
-      if (e.type === type) ref.current(e as Extract<WsEvent, { type: T }>);
+      if (e.type === type) ref.current(e as Extract<SseEvent, { type: T }>);
     });
     return off;
   }, [type]);
 }
 
-/** React hook: open the WS once on mount, close on unmount. */
 export function useWsConnection() {
   const [state, setState] = useState<"idle" | "open" | "closed">(getToken() ? "idle" : "closed");
   useEffect(() => {
-    const ws = openWs();
-    if (!ws) return;
+    const s = openWs();
+    if (!s) return;
     const onOpen = () => setState("open");
-    const onClose = () => setState("closed");
-    ws.addEventListener("open", onOpen);
-    ws.addEventListener("close", onClose);
+    const onError = () => {
+      // EventSource doesn't fire 'close' on disconnect attempts; treat
+      // error as "not currently open" but it'll come back via reconnect.
+      if (s.readyState === EventSource.CLOSED) setState("closed");
+    };
+    s.addEventListener("open", onOpen);
+    s.addEventListener("error", onError);
     return () => {
-      ws.removeEventListener("open", onOpen);
-      ws.removeEventListener("close", onClose);
+      s.removeEventListener("open", onOpen);
+      s.removeEventListener("error", onError);
     };
   }, []);
   return state;

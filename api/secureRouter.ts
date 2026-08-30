@@ -5,7 +5,7 @@ import { and, asc, eq, gt } from "drizzle-orm";
 import { createRouter, publicQuery } from "./middleware";
 import { authedQuery } from "./auth";
 import { getDb } from "./queries/connection";
-import { wsHub } from "./ws/hub";
+import { sseHub } from "./sse/hub";
 import { ensureWritable, getDb } from "./queries/connection";
 import { agents, sessions, channels, memberships, messages } from "@db/schema";
 
@@ -127,11 +127,11 @@ export const secureRouter = createRouter({
       if (!existing) {
         await ensureWritable();
         await db.insert(memberships).values({ channelId: channel.id, agentId: ctx.agentId });
-        wsHub.broadcast(channel.id, {
+        sseHub.broadcast(channel.id, {
           type: "channel.member_joined",
           channelId: channel.id,
           agentId: ctx.agentId,
-          online: wsHub.presenceSnapshot(channel.id),
+          online: sseHub.presenceSnapshot(channel.id),
         });
       }
       return { channelId: channel.id };
@@ -181,7 +181,7 @@ export const secureRouter = createRouter({
         ciphertext: input.ciphertext,
         nonce: input.nonce,
       }).returning({ id: messages.id, createdAt: messages.createdAt });
-      wsHub.broadcast(input.channelId, {
+      sseHub.broadcast(input.channelId, {
         type: "message.created",
         channelId: input.channelId,
         message: {

@@ -5,6 +5,7 @@ import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { appRouter } from "./router";
 import { createContext } from "./context";
 import { env } from "./lib/env";
+import { sseHandler, sseChannelControls } from "./sse/handler";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
@@ -18,9 +19,14 @@ app.use("/api/trpc/*", async (c) => {
   });
 });
 
-// Health/pong endpoint for the WebSocket — separate from /api/trpc/ping
-// which is the tRPC route used by the deploy health check.
-app.get("/ws-ping", (c) => c.json({ ok: true, ws: "available" }));
+// Health endpoint for the SSE route (separate from tRPC ping used by
+// Render's deploy health check).
+app.get("/sse-ping", (c) => c.json({ ok: true, transport: "sse" }));
+
+// SSE endpoint + companion REST controls
+sseHandler(app);
+sseChannelControls(app);
+
 app.all("/api/*", (c) => c.json({ error: "Not Found" }, 404));
 
 export default app;
@@ -28,27 +34,10 @@ export default app;
 if (env.isProduction) {
   const { serve } = await import("@hono/node-server");
   const { serveStaticFiles } = await import("./lib/vite");
-  const { WebSocketServer } = await import("ws");
-  const { handleWsConnection } = await import("./ws/handler");
   serveStaticFiles(app);
 
   const port = parseInt(process.env.PORT || "3000");
-  const server = serve({ fetch: app.fetch, port }, () => {
+  serve({ fetch: app.fetch, port }, () => {
     console.log(`Server running on http://localhost:${port}/`);
-  });
-
-  // WebSocket server: only intercepts upgrades on /ws, lets everything
-  // else pass through to Hono.
-  const wss = new WebSocketServer({ noServer: true });
-  wss.on("connection", handleWsConnection);
-  server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== "/ws") {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
   });
 }
